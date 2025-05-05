@@ -9,10 +9,8 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
-	"github.com/gofiber/fiber/v2/middleware/filesystem"
 	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/logger"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/patrickmn/go-cache"
 	"github.com/pckhoi/casbin-pgx-adapter"
@@ -20,7 +18,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/bcrypt"
-	"net/http"
 
 	"github.com/casbin/casbin/v2"
 	"github.com/golang-jwt/jwt/v5"
@@ -32,18 +29,14 @@ type Config struct {
 	JWTSecret       string
 	Port            string
 	CasbinModelPath string
-	FrontendDir     string
 }
 
-// User represents a user with roles and status
+// User represents a user with roles
 type User struct {
-	ID        int       `json:"id"`
-	Username  string    `json:"username"`
-	Password  string    `json:"password"` // Bcrypt-hashed password
-	Roles     []string  `json:"roles"`
-	Status    string    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID       int
+	Username string
+	Password string // Hashed password
+	Roles    []string
 }
 
 // Claims for JWT
@@ -92,12 +85,10 @@ func main() {
 	})
 
 	// Middleware
-	if os.Getenv("ENV") == "development" {
-		app.Use(cors.New(cors.Config{
-			AllowOrigins: "http://localhost:3000", // For Vite dev server
-			AllowMethods: "GET,POST,PUT,DELETE",
-		}))
-	}
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "http://localhost:3000", // Update for production
+		AllowMethods: "GET,POST,PUT,DELETE",
+	}))
 	app.Use(limiter.New(limiter.Config{
 		Max:        100,
 		Expiration: 1 * time.Minute,
@@ -106,19 +97,14 @@ func main() {
 		Format: "[${time}] ${status} - ${method} ${path}\n",
 	}))
 
-	// API routes
-	api := app.Group("/api")
-	api.Get("/public", publicHandler)
-	api.Post("/login", loginHandler)
-	api.Get("/admin", jwtMiddleware, casbinMiddleware("admin"), adminHandler)
-	api.Get("/user", jwtMiddleware, casbinMiddleware("end_user_read_only", "end_user_manager"), userHandler)
+	// Routes
+	app.Get("/api/public", publicHandler)
+	app.Post("/api/login", loginHandler)
 
-	// Serve frontend static files
-	app.Use("/", filesystem.New(filesystem.Config{
-		Root:         http.FS(os.DirFS(config.FrontendDir)),
-		Index:        "index.html",
-		NotFoundFile: "index.html", // Handle SPA routing
-	}))
+	// Protected routes
+	api := app.Group("/api", jwtMiddleware)
+	api.Get("/admin", casbinMiddleware("admin"), adminHandler)
+	api.Get("/user", casbinMiddleware("end_user_read_only", "end_user_manager"), userHandler)
 
 	// Start server
 	addr := fmt.Sprintf(":%s", config.Port)
@@ -142,7 +128,6 @@ func initConfig() error {
 		JWTSecret:       viper.GetString("JWT_SECRET"),
 		Port:            viper.GetString("PORT"),
 		CasbinModelPath: viper.GetString("CASBIN_MODEL_PATH"),
-		FrontendDir:     viper.GetString("FRONTEND_DIR"),
 	}
 
 	if config.DatabaseURL == "" {
@@ -158,22 +143,13 @@ func initConfig() error {
 	if config.CasbinModelPath == "" {
 		return fmt.Errorf("CASBIN_MODEL_PATH is required")
 	}
-	if config.FrontendDir == "" {
-		config.FrontendDir = "frontend/dist" // Default frontend build directory
-		log.Warn().Msg("FRONTEND_DIR not set, using default frontend/dist")
-	}
 
 	// Verify Casbin model file exists
 	if _, err := os.Stat(config.CasbinModelPath); os.IsNotExist(err) {
 		return fmt.Errorf("Casbin model file not found at %s", config.CasbinModelPath)
 	}
 
-	// Verify frontend directory exists
-	if _, err := os.Stat(config.FrontendDir); os.IsNotExist(err) {
-		log.Warn().Msgf("Frontend directory not found at %s, ensure frontend is built", config.FrontendDir)
-	}
-
-	log.Info().Msgf("Configuration loaded: Port=%s, CasbinModelPath=%s, FrontendDir=%s", config.Port, config.CasbinModelPath, config.FrontendDir)
+	log.Info().Msgf("Configuration loaded: Port=%s, CasbinModelPath=%s", config.Port, config.CasbinModelPath)
 	return nil
 }
 
@@ -185,16 +161,13 @@ func initDatabase() error {
 		return fmt.Errorf("unable to connect to database: %w", err)
 	}
 
-	// Test connection with retry
-	for i := 0; i < 5; i++ {
-		if err = dbPool.Ping(context.Background()); err == nil {
-			log.Info().Msg("Connected to PostgreSQL")
-			return nil
-		}
-		log.Warn().Err(err).Msgf("Database ping failed, retrying (%d/5)", i+1)
-		time.Sleep(2 * time.Second)
+	// Test connection
+	if err := dbPool.Ping(context.Background()); err != nil {
+		return fmt.Errorf("database ping failed: %w", err)
 	}
-	return fmt.Errorf("database ping failed after retries: %w", err)
+
+	log.Info().Msg("Connected to PostgreSQL")
+	return nil
 }
 
 // initCasbin sets up Casbin with pgx adapter
@@ -280,26 +253,15 @@ func loginHandler(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid input"})
 	}
 
-	// Query user from database
-	var user User
-	err := dbPool.QueryRow(context.Background(),
-		"SELECT id, username, password, roles, status, created_at, updated_at FROM users WHERE username = $1",
-		input.Username).Scan(&user.ID, &user.Username, &user.Password, &user.Roles, &user.Status, &user.CreatedAt, &user.UpdatedAt)
-	if err != nil {
-		if err == pgx.ErrNoRows {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid credentials"})
-		}
-		log.Error().Err(err).Msg("Failed to query user")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	// Mock user lookup (replace with pgx query)
+	user := User{
+		ID:       1,
+		Username: "admin",
+		Password: hashPassword("admin123"), // Pre-hashed for demo
+		Roles:    []string{"admin"},
 	}
 
-	// Check user status
-	if user.Status != "active" {
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": fmt.Sprintf("Account is %s", user.Status)})
-	}
-
-	// Verify password
-	if !checkPassword(input.Password, user.Password) {
+	if input.Username != user.Username || !checkPassword(input.Password, user.Password) {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Invalid credentials"})
 	}
 
@@ -317,7 +279,6 @@ func loginHandler(c *fiber.Ctx) error {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	tokenString, err := token.SignedString([]byte(config.JWTSecret))
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to generate token")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate token"})
 	}
 
@@ -337,13 +298,13 @@ func userHandler(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "User access granted"})
 }
 
-// hashPassword generates a bcrypt-hashed password
+// hashPassword generates a hashed password
 func hashPassword(password string) string {
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(hash)
 }
 
-// checkPassword verifies a password against a bcrypt hash
+// checkPassword verifies a password
 func checkPassword(password, hash string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
