@@ -3,10 +3,9 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
-  server: {
-    port: 3000,
-  },
+  root: '.', // Ensure root is set to the directory containing index.html
   build: {
-    outDir: 'dist',
+    outDir: 'dist', // Default output directory
+    assetsDir: 'assets', //Assets subdirectory
   },
 });
